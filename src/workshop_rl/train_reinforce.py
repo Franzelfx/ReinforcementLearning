@@ -68,7 +68,10 @@ class WorkshopConfig:
     render_mode: str | None = "rgb_array"
     domain_randomize: bool = False
     save_plot_path: str = "training_rewards.png"
+    attention_plot_path: str = "attention_weights.png"
     model_path: str = "car_racing_policy.pt"
+    transformer_embed_dim: int = 32
+    transformer_num_layers: int = 5
 
 
 @dataclass(slots=True)
@@ -168,26 +171,72 @@ def preprocess_observation(observation: np.ndarray, device: torch.device) -> Ten
     return stacked
 
 
-class FrameFeatureAttention(nn.Module):
-    """Gewichtet die Frames im Stack anhand gelernter Aufmerksamkeitswerte."""
+class FrameTransformerAttention(nn.Module):
+    """Transformer-basierte Aufmerksamkeit ueber die Frames im Stack.
 
-    def __init__(self, frame_count: int, hidden_dim: int = 16) -> None:
+    Jeder Frame wird als Token mit Dimension ``embed_dim`` behandelt.
+    Ein mehrstufiger Transformer-Encoder (``num_layers`` Schichten) lernt
+    Beziehungen zwischen den Frames.  Gelernte Positions-Embeddings kodieren
+    die zeitliche Reihenfolge im Stack.
+
+    Aufbau pro Encoder-Schicht:
+    - Multi-Head Self-Attention (nhead Koepfe)
+    - Feed-Forward-Netz mit ReLU (4 * embed_dim hidden)
+    - Layer-Norm + Residual-Verbindungen
+    """
+
+    def __init__(
+        self,
+        frame_count: int,
+        embed_dim: int = 32,
+        num_layers: int = 5,
+        nhead: int = 4,
+        dropout: float = 0.1,
+    ) -> None:
         super().__init__()
-        self.score_net = nn.Sequential(
-            nn.Linear(frame_count, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, frame_count),
+        self.frame_count = frame_count
+        self.embed_dim = embed_dim
+
+        # Projiziert den gemittelten Pixelwert jedes Frames (1 Skalar) in den Embedding-Raum.
+        self.input_proj = nn.Linear(1, embed_dim)
+
+        # Lernbares Positions-Embedding fuer jeden Frame-Index.
+        self.pos_embedding = nn.Parameter(torch.zeros(frame_count, embed_dim))
+        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=nhead,
+            dim_feedforward=4 * embed_dim,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Fasst jedes Transformer-Token zu einem skalaren Score zusammen.
+        self.score_head = nn.Linear(embed_dim, 1)
 
     def forward(self, frame_stack: Tensor) -> tuple[Tensor, Tensor]:
         if frame_stack.ndim != 4:
             raise ValueError(
-                f"FrameFeatureAttention erwartet BxTxHxW, erhalten: {tuple(frame_stack.shape)}"
+                f"FrameTransformerAttention erwartet BxTxHxW, erhalten: {tuple(frame_stack.shape)}"
             )
 
-        frame_summary = frame_stack.mean(dim=(2, 3))
-        logits = self.score_net(frame_summary)
-        weights = torch.softmax(logits, dim=1)
+        # (B, T, H, W) -> mittlerer Pixelwert je Frame -> (B, T, 1)
+        frame_summary = frame_stack.mean(dim=(2, 3)).unsqueeze(-1)
+
+        # Einbettung + Positions-Encoding: (B, T, embed_dim)
+        tokens = self.input_proj(frame_summary) + self.pos_embedding.unsqueeze(0)
+
+        # Transformer-Encoder: (B, T, embed_dim)
+        encoded = self.transformer(tokens)
+
+        # Score je Token -> Softmax-Gewichte: (B, T)
+        scores = self.score_head(encoded).squeeze(-1)
+        weights = torch.softmax(scores, dim=1)
+
+        # Gewichteter Frame-Stack
         weighted_stack = frame_stack * weights.unsqueeze(-1).unsqueeze(-1)
         return weighted_stack, weights
 
@@ -199,9 +248,19 @@ class PolicyNetwork(nn.Module):
     kategoriale Verteilung, aus der eine diskrete Aktion gesampelt wird.
     """
 
-    def __init__(self, action_count: int, hidden_dim: int) -> None:
+    def __init__(
+        self,
+        action_count: int,
+        hidden_dim: int,
+        transformer_embed_dim: int = 32,
+        transformer_num_layers: int = 5,
+    ) -> None:
         super().__init__()
-        self.frame_attention = FrameFeatureAttention(frame_count=FRAME_STACK_SIZE)
+        self.frame_attention = FrameTransformerAttention(
+            frame_count=FRAME_STACK_SIZE,
+            embed_dim=transformer_embed_dim,
+            num_layers=transformer_num_layers,
+        )
         self.last_attention_weights: Tensor | None = None
         self.encoder = nn.Sequential(
             nn.Conv2d(FRAME_STACK_SIZE, 16, kernel_size=8, stride=4),
@@ -406,9 +465,15 @@ def train(config: WorkshopConfig) -> list[float]:
     for label in action_mapper.describe():
         print(f"  {label}")
 
-    policy = PolicyNetwork(action_count=action_mapper.size, hidden_dim=config.hidden_dim).to(device)
+    policy = PolicyNetwork(
+        action_count=action_mapper.size,
+        hidden_dim=config.hidden_dim,
+        transformer_embed_dim=config.transformer_embed_dim,
+        transformer_num_layers=config.transformer_num_layers,
+    ).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=config.learning_rate)
     reward_history: list[float] = []
+    attention_history: list[list[float]] = []
 
     try:
         for episode_index in range(1, config.episodes + 1):
@@ -422,6 +487,7 @@ def train(config: WorkshopConfig) -> list[float]:
             )
             loss_value = update_policy_from_episode(episode, policy, optimizer, config, device)
             reward_history.append(episode.episode_reward)
+            attention_history.append(episode.attention_mean_weights)
 
             mean_recent = float(np.mean(reward_history[-10:]))
             attention_str = " | ".join(
@@ -441,7 +507,7 @@ def train(config: WorkshopConfig) -> list[float]:
     save_model(policy, config.model_path)
     print(f"Modell gespeichert unter: {config.model_path}")
 
-    return reward_history
+    return reward_history, attention_history
 
 
 def evaluate(config: WorkshopConfig) -> None:
@@ -451,7 +517,12 @@ def evaluate(config: WorkshopConfig) -> None:
     device = torch.device(config.device)
     env = make_env(config, render_mode=config.render_mode)
     action_mapper = DiscreteActionMapper()
-    policy = PolicyNetwork(action_count=action_mapper.size, hidden_dim=config.hidden_dim).to(device)
+    policy = PolicyNetwork(
+        action_count=action_mapper.size,
+        hidden_dim=config.hidden_dim,
+        transformer_embed_dim=config.transformer_embed_dim,
+        transformer_num_layers=config.transformer_num_layers,
+    ).to(device)
     load_model_if_available(policy, config.model_path, device)
 
     try:
@@ -475,6 +546,31 @@ def evaluate(config: WorkshopConfig) -> None:
             )
     finally:
         env.close()
+
+
+def save_attention_plot(attention_history: list[list[float]], output_path: str) -> Path:
+    """Speichert eine Heatmap der Attention-Gewichte ueber alle Episoden.
+
+    Zeilen entsprechen Episoden, Spalten den Frame-Indizes im Stack.
+    Hellere Farben bedeuten hoehere Aufmerksamkeit auf den jeweiligen Frame.
+    """
+
+    path = Path(output_path)
+    data = np.array(attention_history)  # shape: (episodes, frames)
+    fig, ax = plt.subplots(figsize=(max(8, data.shape[1] // 2), 5))
+    im = ax.imshow(data, aspect="auto", interpolation="nearest", cmap="viridis")
+    fig.colorbar(im, ax=ax, label="Attention-Gewicht")
+    ax.set_xlabel("Frame-Index")
+    ax.set_ylabel("Episode")
+    ax.set_title("CarRacing Workshop: Attention-Gewichte pro Episode")
+    ax.set_xticks(range(data.shape[1]))
+    ax.set_xticklabels([f"F{i}" for i in range(data.shape[1])], rotation=90, fontsize=7)
+    ax.set_yticks(range(data.shape[0]))
+    ax.set_yticklabels([str(i + 1) for i in range(data.shape[0])], fontsize=7)
+    plt.tight_layout()
+    plt.savefig(path, dpi=120)
+    plt.close()
+    return path
 
 
 def save_reward_plot(rewards: list[float], output_path: str) -> Path:
@@ -532,7 +628,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--render", choices=["none", "human", "rgb_array"], default="rgb_array")
     parser.add_argument("--domain-randomize", action="store_true")
     parser.add_argument("--save-plot", default="training_rewards.png")
+    parser.add_argument("--attention-plot", default="attention_weights.png")
     parser.add_argument("--model-path", default="car_racing_policy.pt")
+    parser.add_argument("--transformer-embed-dim", type=int, default=32)
+    parser.add_argument("--transformer-num-layers", type=int, default=5)
     return parser
 
 
@@ -549,7 +648,10 @@ def config_from_args(args: argparse.Namespace) -> WorkshopConfig:
         render_mode=render_mode,
         domain_randomize=args.domain_randomize,
         save_plot_path=args.save_plot,
+        attention_plot_path=args.attention_plot,
         model_path=args.model_path,
+        transformer_embed_dim=args.transformer_embed_dim,
+        transformer_num_layers=args.transformer_num_layers,
     )
 
 
@@ -559,9 +661,11 @@ def main() -> None:
     config = config_from_args(args)
 
     if args.mode == "train":
-        rewards = train(config)
+        rewards, attention_history = train(config)
         plot_path = save_reward_plot(rewards, config.save_plot_path)
         print(f"Reward-Kurve gespeichert unter: {plot_path}")
+        attention_path = save_attention_plot(attention_history, config.attention_plot_path)
+        print(f"Attention-Heatmap gespeichert unter: {attention_path}")
     else:
         evaluate(config)
 
