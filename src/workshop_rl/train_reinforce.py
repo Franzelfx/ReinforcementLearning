@@ -20,6 +20,7 @@ Dadurch bleibt die Policy als kategoriale Verteilung leicht verstaendlich.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -30,6 +31,21 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.distributions import Categorical
+
+
+# Vorverarbeitungskonstanten fuer den Workshop
+PROCESSED_HEIGHT = 96
+PROCESSED_WIDTH = 96
+FRAME_STACK_SIZE = 32
+
+
+_frame_stack_buffer: deque[Tensor] = deque(maxlen=FRAME_STACK_SIZE)
+
+
+def reset_preprocess_state() -> None:
+    """Leert den internen Frame-Stack zu Episodenbeginn."""
+
+    _frame_stack_buffer.clear()
 
 
 @dataclass(slots=True)
@@ -132,9 +148,23 @@ def preprocess_observation(observation: np.ndarray, device: torch.device) -> Ten
     - Frame-Stacking in einer Wrapper-Struktur
     """
 
-    tensor = torch.from_numpy(observation).float() / 255.0
-    tensor = tensor.permute(2, 0, 1).unsqueeze(0)
-    return tensor.to(device)
+    # 1) RGB -> Graustufen, um die Eingabe zu vereinfachen.
+    rgb = observation.astype(np.float32) / 255.0
+    grayscale = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+
+    processed = torch.from_numpy(grayscale).unsqueeze(0).unsqueeze(0).to(device)
+
+    # 2) Frame-Stacking fuer Bewegungsinformation.
+    # Beim ersten Schritt fuellen wir den Puffer mit identischen Frames auf.
+    current_frame = processed.squeeze(0)
+    if not _frame_stack_buffer:
+        for _ in range(FRAME_STACK_SIZE):
+            _frame_stack_buffer.append(current_frame)
+    else:
+        _frame_stack_buffer.append(current_frame)
+
+    stacked = torch.cat(list(_frame_stack_buffer), dim=0).unsqueeze(0)
+    return stacked
 
 
 class PolicyNetwork(nn.Module):
@@ -147,7 +177,7 @@ class PolicyNetwork(nn.Module):
     def __init__(self, action_count: int, hidden_dim: int) -> None:
         super().__init__()
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=8, stride=4),
+            nn.Conv2d(FRAME_STACK_SIZE, 16, kernel_size=8, stride=4),
             nn.ReLU(),
             nn.Conv2d(16, 32, kernel_size=4, stride=2),
             nn.ReLU(),
@@ -165,7 +195,7 @@ class PolicyNetwork(nn.Module):
         )
 
     def _infer_encoder_size(self) -> int:
-        dummy = torch.zeros(1, 3, 96, 96)
+        dummy = torch.zeros(1, FRAME_STACK_SIZE, PROCESSED_HEIGHT, PROCESSED_WIDTH)
         with torch.no_grad():
             return int(self.encoder(dummy).shape[1])
 
@@ -226,6 +256,7 @@ def run_episode(
     """
 
     observation, _ = env.reset(seed=episode_seed)
+    reset_preprocess_state()
     log_probs: list[Tensor] = []
     rewards: list[float] = []
     entropies: list[Tensor] = []
