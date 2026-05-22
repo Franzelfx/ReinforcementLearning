@@ -78,6 +78,7 @@ class EpisodeBatch:
     log_probs: list[Tensor]
     rewards: list[float]
     entropies: list[Tensor]
+    attention_mean_weights: list[float]
     episode_reward: float
     steps: int
 
@@ -288,6 +289,7 @@ def run_episode(
     log_probs: list[Tensor] = []
     rewards: list[float] = []
     entropies: list[Tensor] = []
+    attention_weights: list[Tensor] = []
     episode_reward = 0.0
     steps = 0
 
@@ -295,6 +297,9 @@ def run_episode(
         state = preprocess_observation(observation, device)
         action_index, log_prob, entropy = choose_action(policy, state)
         action = action_mapper[action_index]
+
+        if policy.last_attention_weights is not None:
+            attention_weights.append(policy.last_attention_weights.squeeze(0))
 
         repeated_reward = 0.0
         terminated = False
@@ -316,10 +321,17 @@ def run_episode(
         if terminated or truncated:
             break
 
+    if attention_weights:
+        attention_mean = torch.stack(attention_weights).mean(dim=0)
+        attention_mean_weights = [float(value) for value in attention_mean.tolist()]
+    else:
+        attention_mean_weights = [0.0 for _ in range(FRAME_STACK_SIZE)]
+
     return EpisodeBatch(
         log_probs=log_probs,
         rewards=rewards,
         entropies=entropies,
+        attention_mean_weights=attention_mean_weights,
         episode_reward=episode_reward,
         steps=steps,
     )
@@ -412,12 +424,16 @@ def train(config: WorkshopConfig) -> list[float]:
             reward_history.append(episode.episode_reward)
 
             mean_recent = float(np.mean(reward_history[-10:]))
+            attention_str = " | ".join(
+                f"F{i}:{weight:.3f}" for i, weight in enumerate(episode.attention_mean_weights)
+            )
             print(
                 f"Episode {episode_index:03d} | "
                 f"Reward: {episode.episode_reward:8.2f} | "
                 f"Schritte: {episode.steps:4d} | "
                 f"Loss: {loss_value:10.2f} | "
-                f"Mittel letzte 10: {mean_recent:8.2f}"
+                f"Mittel letzte 10: {mean_recent:8.2f} | "
+                f"Attention: {attention_str}"
             )
     finally:
         env.close()
@@ -448,10 +464,14 @@ def evaluate(config: WorkshopConfig) -> None:
                 device,
                 episode_seed=config.seed + episode_index - 1,
             )
+            attention_str = " | ".join(
+                f"F{i}:{weight:.3f}" for i, weight in enumerate(episode.attention_mean_weights)
+            )
             print(
                 f"Evaluation Episode {episode_index:03d} | "
                 f"Reward: {episode.episode_reward:8.2f} | "
-                f"Schritte: {episode.steps:4d}"
+                f"Schritte: {episode.steps:4d} | "
+                f"Attention: {attention_str}"
             )
     finally:
         env.close()
