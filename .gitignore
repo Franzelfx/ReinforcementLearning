@@ -1,0 +1,13 @@
+# Virtual environment
+venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Local training artifacts
+*.pt
+*.png
+
+# macOS
+.DS_Store
