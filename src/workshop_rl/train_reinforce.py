@@ -167,6 +167,30 @@ def preprocess_observation(observation: np.ndarray, device: torch.device) -> Ten
     return stacked
 
 
+class FrameFeatureAttention(nn.Module):
+    """Gewichtet die Frames im Stack anhand gelernter Aufmerksamkeitswerte."""
+
+    def __init__(self, frame_count: int, hidden_dim: int = 16) -> None:
+        super().__init__()
+        self.score_net = nn.Sequential(
+            nn.Linear(frame_count, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, frame_count),
+        )
+
+    def forward(self, frame_stack: Tensor) -> tuple[Tensor, Tensor]:
+        if frame_stack.ndim != 4:
+            raise ValueError(
+                f"FrameFeatureAttention erwartet BxTxHxW, erhalten: {tuple(frame_stack.shape)}"
+            )
+
+        frame_summary = frame_stack.mean(dim=(2, 3))
+        logits = self.score_net(frame_summary)
+        weights = torch.softmax(logits, dim=1)
+        weighted_stack = frame_stack * weights.unsqueeze(-1).unsqueeze(-1)
+        return weighted_stack, weights
+
+
 class PolicyNetwork(nn.Module):
     """Kleines CNN fuer eine diskrete Policy auf Bildbeobachtungen.
 
@@ -176,6 +200,8 @@ class PolicyNetwork(nn.Module):
 
     def __init__(self, action_count: int, hidden_dim: int) -> None:
         super().__init__()
+        self.frame_attention = FrameFeatureAttention(frame_count=FRAME_STACK_SIZE)
+        self.last_attention_weights: Tensor | None = None
         self.encoder = nn.Sequential(
             nn.Conv2d(FRAME_STACK_SIZE, 16, kernel_size=8, stride=4),
             nn.ReLU(),
@@ -200,7 +226,9 @@ class PolicyNetwork(nn.Module):
             return int(self.encoder(dummy).shape[1])
 
     def forward(self, observation: Tensor) -> Tensor:
-        encoded = self.encoder(observation)
+        attended, weights = self.frame_attention(observation)
+        self.last_attention_weights = weights.detach()
+        encoded = self.encoder(attended)
         return self.policy_head(encoded)
 
 
