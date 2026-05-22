@@ -4,17 +4,20 @@ Die Datei ist absichtlich linear und stark dokumentiert aufgebaut.
 Sie soll wie ein kleiner roter Faden gelesen werden koennen:
 
 1. Konfiguration
-2. Aktionsabbildung
-3. Vorverarbeitung
-4. Modell
+2. Vorverarbeitung
+3. Modell (Transformer-Attention + CNN)
+4. Kontinuierliche Aktionsausgabe
 5. Datensammlung
 6. REINFORCE-Update
 7. Training und Evaluation
 
 Wichtige didaktische Entscheidung:
-Wir verwenden CarRacing mit kontinuierlichem Umgebungsformat,
-aber mappen intern auf eine kleine diskrete Aktionsmenge.
-Dadurch bleibt die Policy als kategoriale Verteilung leicht verstaendlich.
+Wir verwenden CarRacing mit kontinuierlichem Umgebungsformat.
+Die Policy gibt drei float32-Ausgaben aus:
+  - Lenkung  in [-1, 1]   (via tanh)
+  - Gas      in [ 0, 1]   (via sigmoid)
+  - Bremse   in [ 0, 1]   (via sigmoid)
+Das Sampling erfolgt ueber eine Normal-Verteilung mit gelernter log-Standardabweichung.
 """
 
 from __future__ import annotations
@@ -23,14 +26,12 @@ import argparse
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
-
 import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch import Tensor, nn
-from torch.distributions import Categorical
+from torch.distributions import Normal
 
 
 # Vorverarbeitungskonstanten fuer den Workshop
@@ -85,46 +86,6 @@ class EpisodeBatch:
     episode_reward: float
     steps: int
 
-
-class DiscreteActionMapper:
-    """Mappt diskrete Aktions-IDs auf das CarRacing-Aktionsformat.
-
-    CarRacing erwartet drei kontinuierliche Werte:
-
-    - steering in [-1, 1]
-    - gas in [0, 1]
-    - brake in [0, 1]
-
-    Fuer den Workshop reduzieren wir das auf wenige handliche Aktionen.
-    Die Liste ist absichtlich leicht veraenderbar, damit Teilnehmende sie in
-    einer spaeteren Aufgabe erweitern koennen.
-    """
-
-    def __init__(self) -> None:
-        self._actions = [
-            np.array([0.0, 0.0, 0.0], dtype=np.float32),
-            np.array([0.6, 0.0, 0.0], dtype=np.float32),
-            np.array([-0.6, 0.0, 0.0], dtype=np.float32),
-            np.array([0.0, 0.7, 0.0], dtype=np.float32),
-            np.array([0.0, 0.0, 0.8], dtype=np.float32),
-        ]
-
-    @property
-    def size(self) -> int:
-        return len(self._actions)
-
-    def __getitem__(self, index: int) -> np.ndarray:
-        return self._actions[index]
-
-    def describe(self) -> Iterable[str]:
-        labels = [
-            "0 = nichts tun",
-            "1 = rechts lenken",
-            "2 = links lenken",
-            "3 = Gas geben",
-            "4 = bremsen",
-        ]
-        return labels
 
 
 def set_global_seed(seed: int) -> None:
@@ -241,16 +202,24 @@ class FrameTransformerAttention(nn.Module):
         return weighted_stack, weights
 
 
-class PolicyNetwork(nn.Module):
-    """Kleines CNN fuer eine diskrete Policy auf Bildbeobachtungen.
+# Anzahl der kontinuierlichen Aktionsdimensionen in CarRacing:
+# [0] Lenkung  in [-1, 1]
+# [1] Gas      in [ 0, 1]
+# [2] Bremse   in [ 0, 1]
+ACTION_DIM = 3
 
-    Das Modell gibt Logits aus. Aus diesen Logits erzeugen wir spaeter eine
-    kategoriale Verteilung, aus der eine diskrete Aktion gesampelt wird.
+
+class PolicyNetwork(nn.Module):
+    """CNN-Policy mit kontinuierlichen float32-Ausgaben fuer CarRacing.
+
+    Die Policy modelliert eine Normal-Verteilung ueber drei Aktionsdimensionen.
+    ``forward`` gibt Mittelwerte (mean) und log-Standardabweichungen (log_std)
+    zurueck.  Das Sampling und die Bounds-Transformation (tanh / sigmoid)
+    erfolgen in ``choose_action``.
     """
 
     def __init__(
         self,
-        action_count: int,
         hidden_dim: int,
         transformer_embed_dim: int = 32,
         transformer_num_layers: int = 5,
@@ -277,19 +246,23 @@ class PolicyNetwork(nn.Module):
         self.policy_head = nn.Sequential(
             nn.Linear(encoder_out, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, action_count),
+            nn.Linear(hidden_dim, ACTION_DIM),
         )
+        # Lernbare log-Standardabweichung, eine pro Aktionsdimension.
+        self.log_std = nn.Parameter(torch.zeros(ACTION_DIM))
 
     def _infer_encoder_size(self) -> int:
         dummy = torch.zeros(1, FRAME_STACK_SIZE, PROCESSED_HEIGHT, PROCESSED_WIDTH)
         with torch.no_grad():
             return int(self.encoder(dummy).shape[1])
 
-    def forward(self, observation: Tensor) -> Tensor:
+    def forward(self, observation: Tensor) -> tuple[Tensor, Tensor]:
         attended, weights = self.frame_attention(observation)
         self.last_attention_weights = weights.detach()
         encoded = self.encoder(attended)
-        return self.policy_head(encoded)
+        mean = self.policy_head(encoded)          # (B, ACTION_DIM)
+        log_std = self.log_std.expand_as(mean)    # (B, ACTION_DIM)
+        return mean, log_std
 
 
 def discounted_returns(rewards: list[float], gamma: float, device: torch.device) -> Tensor:
@@ -311,27 +284,47 @@ def discounted_returns(rewards: list[float], gamma: float, device: torch.device)
     return torch.tensor(returns, dtype=torch.float32, device=device)
 
 
-def choose_action(policy: PolicyNetwork, observation: Tensor) -> tuple[int, Tensor, Tensor]:
-    """Fuehrt einen Forward-Pass aus und sampelt eine Aktion.
+def choose_action(
+    policy: PolicyNetwork, observation: Tensor
+) -> tuple[np.ndarray, Tensor, Tensor]:
+    """Fuehrt einen Forward-Pass aus und sampelt eine kontinuierliche Aktion.
 
     Rueckgabe:
-    - diskrete Aktions-ID
-    - Log-Wahrscheinlichkeit der gewaelten Aktion
-    - Entropie der Verteilung
+    - float32-Array [steering, gas, brake] fuer env.step()
+    - Log-Wahrscheinlichkeit der gesampelten Aktion (ueber alle Dimensionen)
+    - Entropie der Verteilung (ueber alle Dimensionen)
+
+    Bounds-Transformation:
+    - Lenkung : tanh   -> [-1, 1]
+    - Gas     : sigmoid -> [0, 1]
+    - Bremse  : sigmoid -> [0, 1]
+
+    TODO fuer den Workshop:
+    Streng genommen muss bei der Transformation tanh/sigmoid der Log-Prob um
+    den Jacobian-Term korrigiert werden (vgl. SAC-Paper).  Fuer REINFORCE
+    mit normalisierten Returns ist der Einfluss gering – ein gutes Experiment!
     """
 
-    logits = policy(observation)
-    distribution = Categorical(logits=logits)
-    action = distribution.sample()
-    log_prob = distribution.log_prob(action)
-    entropy = distribution.entropy()
-    return int(action.item()), log_prob.squeeze(), entropy.squeeze()
+    mean, log_std = policy(observation)
+    std = log_std.clamp(min=-4.0, max=1.0).exp()
+    distribution = Normal(mean, std)
+
+    raw = distribution.rsample()                          # (B, 3), differenzierbar
+    steering = torch.tanh(raw[..., 0:1])                 # [-1, 1]
+    gas      = torch.sigmoid(raw[..., 1:2])              # [ 0, 1]
+    brake    = torch.sigmoid(raw[..., 2:3])              # [ 0, 1]
+    action_t = torch.cat([steering, gas, brake], dim=-1) # (B, 3) float32
+
+    log_prob = distribution.log_prob(raw).sum(dim=-1)
+    entropy  = distribution.entropy().sum(dim=-1)
+
+    action_np = action_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    return action_np, log_prob.squeeze(), entropy.squeeze()
 
 
 def run_episode(
     env: gym.Env,
     policy: PolicyNetwork,
-    action_mapper: DiscreteActionMapper,
     config: WorkshopConfig,
     device: torch.device,
     episode_seed: int | None = None,
@@ -354,8 +347,7 @@ def run_episode(
 
     while steps < config.max_steps_per_episode:
         state = preprocess_observation(observation, device)
-        action_index, log_prob, entropy = choose_action(policy, state)
-        action = action_mapper[action_index]
+        action, log_prob, entropy = choose_action(policy, state)
 
         if policy.last_attention_weights is not None:
             attention_weights.append(policy.last_attention_weights.squeeze(0))
@@ -459,14 +451,8 @@ def train(config: WorkshopConfig) -> list[float]:
     set_global_seed(config.seed)
     device = torch.device(config.device)
     env = make_env(config, render_mode=config.render_mode)
-    action_mapper = DiscreteActionMapper()
-
-    print("Verfuegbare diskrete Aktionen:")
-    for label in action_mapper.describe():
-        print(f"  {label}")
 
     policy = PolicyNetwork(
-        action_count=action_mapper.size,
         hidden_dim=config.hidden_dim,
         transformer_embed_dim=config.transformer_embed_dim,
         transformer_num_layers=config.transformer_num_layers,
@@ -480,7 +466,6 @@ def train(config: WorkshopConfig) -> list[float]:
             episode = run_episode(
                 env,
                 policy,
-                action_mapper,
                 config,
                 device,
                 episode_seed=config.seed + episode_index - 1,
@@ -516,9 +501,7 @@ def evaluate(config: WorkshopConfig) -> None:
     set_global_seed(config.seed)
     device = torch.device(config.device)
     env = make_env(config, render_mode=config.render_mode)
-    action_mapper = DiscreteActionMapper()
     policy = PolicyNetwork(
-        action_count=action_mapper.size,
         hidden_dim=config.hidden_dim,
         transformer_embed_dim=config.transformer_embed_dim,
         transformer_num_layers=config.transformer_num_layers,
@@ -530,7 +513,6 @@ def evaluate(config: WorkshopConfig) -> None:
             episode = run_episode(
                 env,
                 policy,
-                action_mapper,
                 config,
                 device,
                 episode_seed=config.seed + episode_index - 1,
