@@ -5,9 +5,13 @@ venv/
 __pycache__/
 *.py[cod]
 
-# Local training artifacts
+# Model weights and reward plots
 *.pt
 *.png
+
+# Downloaded market data and evaluation render logs (per-project)
+src/*/data/
+src/*/render_logs/
 
 # macOS
 .DS_Store
